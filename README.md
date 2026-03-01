@@ -8,6 +8,8 @@ Supports multiple concurrent profiles — run independent speaker groups simulta
 
 Includes a GTK4/libadwaita GUI, a CLI, and a systemd user service for auto-start on login.
 
+![GUI screenshot](screenshots/gui.png)
+
 ## Installation
 
 ### Quick install
