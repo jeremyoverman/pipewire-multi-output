@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Multi-Output Audio
+Comment=Route audio to multiple speakers with delay compensation
+Exec=python3 -m multi_output.gui
+Icon=audio-speakers-symbolic
+Terminal=false
+Categories=AudioVideo;Audio;Settings;
+Keywords=audio;speakers;bluetooth;pipewire;multi-output;
