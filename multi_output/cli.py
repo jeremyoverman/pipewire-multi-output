@@ -61,7 +61,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 more = input("\nAdd another speaker? [y/N]: ").strip().lower()
                 if more != "y":
                     break
-        name_str = input("\nDevice name shown in GNOME [Speakers/Soundbar]: ").strip()
+        name_str = input("\nDevice name shown in sound settings [Speakers/Soundbar]: ").strip()
         config = core.MultiOutputConfig(
             slug=slug,
             name=name_str or "Speakers/Soundbar",
@@ -307,7 +307,7 @@ def main() -> None:
         "--name",
         type=str,
         default=None,
-        help='Device name shown in GNOME (default: "Speakers/Soundbar")',
+        help='Device name shown in sound settings (default: "Speakers/Soundbar")',
     )
     start_p.add_argument(
         "--wait",

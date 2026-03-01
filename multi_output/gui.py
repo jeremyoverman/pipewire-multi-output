@@ -237,7 +237,7 @@ class MultiOutputApp(Adw.Application):
 
         # Device name group
         name_group = Adw.PreferencesGroup(title="Output Device")
-        self.name_entry = Adw.EntryRow(title="Name shown in GNOME")
+        self.name_entry = Adw.EntryRow(title="Name shown in sound settings")
         self.name_entry.set_text(self.config.name)
         self.name_entry.connect("changed", self._on_name_changed)
         name_group.add(self.name_entry)

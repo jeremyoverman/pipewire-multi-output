@@ -71,7 +71,7 @@ class MultiOutputConfig:
     """Configuration for the multi-output setup."""
 
     slug: str = "default"
-    name: str = "Speakers/Soundbar"  # device description shown in GNOME
+    name: str = "Speakers/Soundbar"  # device description shown in sound settings
     speakers: list[SpeakerConfig] = field(default_factory=list)
 
 
