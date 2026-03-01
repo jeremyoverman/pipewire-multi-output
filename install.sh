@@ -30,9 +30,12 @@ sed "s|^Exec=.*|Exec=env PYTHONPATH=${SCRIPT_DIR} python3 -m multi_output.gui|" 
     "${SCRIPT_DIR}/multi-output.desktop" > "${DESKTOP_DIR}/multi-output.desktop"
 echo "  Installed .desktop file to ${DESKTOP_DIR}/multi-output.desktop"
 
-# Install systemd user service via core.py
+# Install systemd user service template via core.py
 python3 -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}'); from multi_output import core; core.install_service()"
-echo "  Installed systemd service to ~/.config/systemd/user/multi-output.service"
+echo "  Installed systemd service template to ~/.config/systemd/user/multi-output@.service"
+
+# Run migration if needed
+python3 -c "import sys; sys.path.insert(0, '${SCRIPT_DIR}'); from multi_output import core; core.migrate_if_needed()"
 
 echo ""
 echo "Done! You can now:"

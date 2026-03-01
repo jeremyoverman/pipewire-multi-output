@@ -5,6 +5,7 @@ Run with: python3 -m multi_output.gui
 
 from __future__ import annotations
 
+import subprocess
 import threading
 
 import gi
@@ -116,9 +117,10 @@ class SpeakerRow(Adw.ExpanderRow):
 
     def _apply_delay(self) -> bool:
         self._debounce_id = 0
-        if core.is_running():
+        slug = self.app.current_slug
+        if core.is_running(slug):
             try:
-                core.update_speaker_delay(self.index, self.speaker.delay_ms)
+                core.update_speaker_delay(slug, self.index, self.speaker.delay_ms)
             except RuntimeError:
                 pass
         return GLib.SOURCE_REMOVE
@@ -133,19 +135,29 @@ class MultiOutputApp(Adw.Application):
             application_id="io.github.pipewire_multi_output",
             flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
         )
+        self.current_slug = "default"
         self.config = core.MultiOutputConfig()
         self.speaker_rows: list[SpeakerRow] = []
+        self._switching_profile = False
 
     def do_activate(self) -> None:
+        # Run migration
+        core.migrate_if_needed()
+
         # Load saved config
-        saved = core.load_config()
+        profiles = core.list_profiles()
+        if profiles:
+            self.current_slug = profiles[0]
+        saved = core.load_config(self.current_slug)
         if saved:
             self.config = saved
+        else:
+            self.config = core.MultiOutputConfig(slug=self.current_slug)
 
         # Window
         self.win = Adw.ApplicationWindow(application=self)
         self.win.set_title("Multi-Output Audio")
-        self.win.set_default_size(500, 600)
+        self.win.set_default_size(500, 650)
 
         # Header bar
         header = Adw.HeaderBar()
@@ -161,6 +173,15 @@ class MultiOutputApp(Adw.Application):
         self.toggle_btn.add_css_class("suggested-action")
         self.toggle_btn.connect("clicked", self._on_toggle)
         header.pack_end(self.toggle_btn)
+
+        # Test tone button
+        self.test_btn = Gtk.ToggleButton(icon_name="audio-speakers-symbolic")
+        self.test_btn.set_tooltip_text("Play test tone for delay tuning")
+        self.test_btn.connect("toggled", self._on_test_toggled)
+        self._test_proc: subprocess.Popen | None = None
+        self._test_ping_data: bytes | None = None
+        self._test_thread: threading.Thread | None = None
+        header.pack_end(self.test_btn)
 
         # Main content
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -181,6 +202,39 @@ class MultiOutputApp(Adw.Application):
         scrolled.set_child(clamp)
         main_box.append(scrolled)
 
+        # Profile selector group
+        profile_group = Adw.PreferencesGroup(title="Profile")
+
+        # Profile selector combo row
+        self.profile_model = Gtk.StringList()
+        self._refresh_profile_model()
+
+        self.profile_combo = Adw.ComboRow(title="Active Profile")
+        self.profile_combo.set_model(self.profile_model)
+        self._select_current_profile_in_combo()
+        self.profile_combo.connect("notify::selected", self._on_profile_changed)
+        profile_group.add(self.profile_combo)
+
+        # + / - buttons in group header suffix
+        profile_btn_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=4,
+        )
+        add_profile_btn = Gtk.Button(icon_name="list-add-symbolic")
+        add_profile_btn.add_css_class("flat")
+        add_profile_btn.set_tooltip_text("New profile")
+        add_profile_btn.connect("clicked", self._on_new_profile)
+        profile_btn_box.append(add_profile_btn)
+
+        del_profile_btn = Gtk.Button(icon_name="list-remove-symbolic")
+        del_profile_btn.add_css_class("flat")
+        del_profile_btn.set_tooltip_text("Delete profile")
+        del_profile_btn.connect("clicked", self._on_delete_profile)
+        profile_btn_box.append(del_profile_btn)
+
+        profile_group.set_header_suffix(profile_btn_box)
+        content.append(profile_group)
+
         # Device name group
         name_group = Adw.PreferencesGroup(title="Output Device")
         self.name_entry = Adw.EntryRow(title="Name shown in GNOME")
@@ -190,10 +244,6 @@ class MultiOutputApp(Adw.Application):
         content.append(name_group)
 
         # Speakers group
-        speakers_group_header = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            margin_bottom=0,
-        )
         self.speakers_group = Adw.PreferencesGroup(title="Speakers")
 
         # Add speaker button
@@ -212,6 +262,7 @@ class MultiOutputApp(Adw.Application):
             margin_bottom=12,
         )
         self.empty_label.add_css_class("dim-label")
+        self._empty_label_added = False
 
         # Settings group
         settings_group = Adw.PreferencesGroup(title="Settings")
@@ -219,11 +270,7 @@ class MultiOutputApp(Adw.Application):
             title="Auto-start on login",
             subtitle="Enable systemd user service",
         )
-        try:
-            self.autostart_row.set_active(core.is_service_enabled())
-        except Exception:
-            self.autostart_row.set_sensitive(False)
-            self.autostart_row.set_subtitle("Service not installed")
+        self._refresh_autostart_state()
         self.autostart_row.connect("notify::active", self._on_autostart_toggled)
         settings_group.add(self.autostart_row)
         content.append(settings_group)
@@ -238,20 +285,152 @@ class MultiOutputApp(Adw.Application):
         self._update_status()
         self.win.present()
 
+    # --- Profile management ---
+
+    def _refresh_profile_model(self) -> None:
+        """Repopulate the profile string list from disk."""
+        self.profile_model.splice(0, self.profile_model.get_n_items(), [])
+        profiles = core.list_profiles()
+        if not profiles:
+            profiles = ["default"]
+        for slug in profiles:
+            self.profile_model.append(slug)
+
+    def _select_current_profile_in_combo(self) -> None:
+        """Set the combo selection to match self.current_slug."""
+        for i in range(self.profile_model.get_n_items()):
+            if self.profile_model.get_string(i) == self.current_slug:
+                self._switching_profile = True
+                self.profile_combo.set_selected(i)
+                self._switching_profile = False
+                return
+
+    def _on_profile_changed(self, combo: Adw.ComboRow, _pspec) -> None:
+        if self._switching_profile:
+            return
+        idx = combo.get_selected()
+        if idx == Gtk.INVALID_LIST_POSITION:
+            return
+        new_slug = self.profile_model.get_string(idx)
+        if new_slug == self.current_slug:
+            return
+
+        # Save current config before switching
+        core.save_config(self.config)
+
+        self.current_slug = new_slug
+        saved = core.load_config(new_slug)
+        if saved:
+            self.config = saved
+        else:
+            self.config = core.MultiOutputConfig(slug=new_slug)
+
+        self.name_entry.set_text(self.config.name)
+        self._rebuild_speaker_list()
+        self._update_status()
+        self._refresh_autostart_state()
+
+    def _on_new_profile(self, _btn: Gtk.Button) -> None:
+        """Prompt for a name and create a new profile."""
+        dialog = Adw.AlertDialog(
+            heading="New Profile",
+            body="Enter a name for the new speaker group:",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("create", "Create")
+        dialog.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("e.g. Living Room")
+        entry.set_margin_start(12)
+        entry.set_margin_end(12)
+        dialog.set_extra_child(entry)
+
+        dialog.connect("response", self._on_new_profile_response, entry)
+        dialog.present(self.win)
+
+    def _on_new_profile_response(self, dialog: Adw.AlertDialog, response: str, entry: Gtk.Entry) -> None:
+        if response != "create":
+            return
+        name = entry.get_text().strip()
+        if not name:
+            return
+
+        # Save current before switching
+        core.save_config(self.config)
+
+        slug = core._unique_slug(name)
+        self.config = core.MultiOutputConfig(slug=slug, name=name)
+        core.save_config(self.config)
+
+        self.current_slug = slug
+        self._refresh_profile_model()
+        self._select_current_profile_in_combo()
+        self.name_entry.set_text(self.config.name)
+        self._rebuild_speaker_list()
+        self._update_status()
+        self._refresh_autostart_state()
+        self.status_label.set_text(f"Created profile '{slug}'.")
+
+    def _on_delete_profile(self, _btn: Gtk.Button) -> None:
+        """Delete the current profile after confirmation."""
+        profiles = core.list_profiles()
+        if len(profiles) <= 1:
+            self.status_label.set_text("Cannot delete the only profile.")
+            return
+
+        dialog = Adw.AlertDialog(
+            heading="Delete Profile?",
+            body=f"Delete profile '{self.current_slug}'? This cannot be undone.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect("response", self._on_delete_profile_response)
+        dialog.present(self.win)
+
+    def _on_delete_profile_response(self, dialog: Adw.AlertDialog, response: str) -> None:
+        if response != "delete":
+            return
+
+        old_slug = self.current_slug
+        if core.is_running(old_slug):
+            core.stop(old_slug)
+        core.delete_profile(old_slug)
+
+        # Switch to another profile
+        profiles = core.list_profiles()
+        self.current_slug = profiles[0] if profiles else "default"
+        saved = core.load_config(self.current_slug)
+        if saved:
+            self.config = saved
+        else:
+            self.config = core.MultiOutputConfig(slug=self.current_slug)
+
+        self._refresh_profile_model()
+        self._select_current_profile_in_combo()
+        self.name_entry.set_text(self.config.name)
+        self._rebuild_speaker_list()
+        self._update_status()
+        self._refresh_autostart_state()
+        self.status_label.set_text(f"Deleted profile '{old_slug}'.")
+
+    # --- Speaker list ---
+
     def _rebuild_speaker_list(self) -> None:
         """Rebuild the speaker list UI from current config."""
-        # Remove existing rows
         for row in self.speaker_rows:
             self.speakers_group.remove(row)
         self.speaker_rows.clear()
 
         if not self.config.speakers:
-            self.speakers_group.add(self.empty_label)
+            if not self._empty_label_added:
+                self.speakers_group.add(self.empty_label)
+                self._empty_label_added = True
         else:
-            try:
+            if self._empty_label_added:
                 self.speakers_group.remove(self.empty_label)
-            except Exception:
-                pass
+                self._empty_label_added = False
             for i, speaker in enumerate(self.config.speakers):
                 row = SpeakerRow(speaker, i, self)
                 self.speakers_group.add(row)
@@ -259,12 +438,12 @@ class MultiOutputApp(Adw.Application):
 
     def _update_status(self) -> None:
         """Update the UI to reflect running state."""
-        running = core.is_running()
+        running = core.is_running(self.current_slug)
         if running:
             self.toggle_btn.set_label("Stop")
             self.toggle_btn.remove_css_class("suggested-action")
             self.toggle_btn.add_css_class("destructive-action")
-            state = core.load_state()
+            state = core.load_state(self.current_slug)
             n = len(state.speakers) if state else 0
             self.status_label.set_text(f"Running ({n} speakers)")
         else:
@@ -273,12 +452,48 @@ class MultiOutputApp(Adw.Application):
             self.toggle_btn.add_css_class("suggested-action")
             self.status_label.set_text("Stopped")
 
+    def _refresh_autostart_state(self) -> None:
+        """Update the autostart toggle for the current profile."""
+        self._toggling_autostart = True
+        try:
+            self.autostart_row.set_sensitive(True)
+            self.autostart_row.set_subtitle("Enable systemd user service")
+            self.autostart_row.set_active(core.is_service_enabled(self.current_slug))
+        except Exception:
+            self.autostart_row.set_sensitive(False)
+            self.autostart_row.set_subtitle("Service not installed")
+        self._toggling_autostart = False
+
+    def _on_test_toggled(self, btn: Gtk.ToggleButton) -> None:
+        if btn.get_active():
+            self._test_ping_data = core.generate_ping(frequency=1000, duration_ms=100)
+            self._test_stop = threading.Event()
+            self._test_thread = threading.Thread(
+                target=self._test_tone_loop, daemon=True,
+            )
+            self._test_thread.start()
+            self.status_label.set_text("Playing test tone... toggle off to stop.")
+        else:
+            self._test_stop.set()
+            if self._test_proc and self._test_proc.poll() is None:
+                self._test_proc.terminate()
+            self._test_thread = None
+            self._update_status()
+
+    def _test_tone_loop(self) -> None:
+        cmd = ["paplay", "--raw", "--rate=48000", "--channels=1", "--format=s16le"]
+        while not self._test_stop.is_set():
+            self._test_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            self._test_proc.communicate(input=self._test_ping_data)
+            self._test_stop.wait(timeout=1.5)
+        self._test_proc = None
+
     def _on_name_changed(self, entry: Adw.EntryRow) -> None:
         self.config.name = entry.get_text()
 
     def _on_toggle(self, _btn: Gtk.Button) -> None:
-        if core.is_running():
-            core.stop()
+        if core.is_running(self.current_slug):
+            core.stop(self.current_slug)
             self._update_status()
         else:
             if not self.config.speakers:
@@ -311,7 +526,7 @@ class MultiOutputApp(Adw.Application):
         if getattr(self, "_toggling_autostart", False):
             return
         try:
-            core.set_service_enabled(row.get_active())
+            core.set_service_enabled(self.current_slug, row.get_active())
             action = "enabled" if row.get_active() else "disabled"
             self.status_label.set_text(f"Auto-start {action}.")
         except Exception as e:
@@ -322,7 +537,6 @@ class MultiOutputApp(Adw.Application):
 
     def _on_add_speaker(self, _btn: Gtk.Button) -> None:
         """Show a dialog to pick a sink to add."""
-        # Get currently selected sink names
         selected = {s.sink_name for s in self.config.speakers}
         available = core.get_available_sinks(list(selected))
 
@@ -335,7 +549,6 @@ class MultiOutputApp(Adw.Application):
             dialog.present(self.win)
             return
 
-        # Build a selection dialog
         dialog = Adw.AlertDialog(
             heading="Add Speaker",
             body="Select an audio output to add:",
@@ -359,7 +572,6 @@ class MultiOutputApp(Adw.Application):
             row.sink_data = sink
             listbox.append(row)
 
-        # Select first row
         listbox.select_row(listbox.get_row_at_index(0))
 
         dialog.set_extra_child(listbox)
@@ -380,7 +592,6 @@ class MultiOutputApp(Adw.Application):
         if selected_row is None:
             return
 
-        # Get the sink data from the selected row's index
         idx = selected_row.get_index()
         sink = available[idx]
 

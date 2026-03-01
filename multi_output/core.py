@@ -2,6 +2,9 @@
 
 Creates a null sink as a routing hub, then uses pw-loopback to send audio
 to N speakers simultaneously with per-speaker delay compensation.
+
+Supports multiple concurrent profiles, each with its own null sink,
+loopbacks, config, and state.
 """
 
 from __future__ import annotations
@@ -19,18 +22,39 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-NULL_SINK_NAME = "multi_out"
-
 CONFIG_DIR = Path.home() / ".config" / "pipewire-multi-output"
-CONFIG_FILE = CONFIG_DIR / "config.json"
+PROFILES_DIR = CONFIG_DIR / "profiles"
 STATE_DIR = Path.home() / ".cache" / "pipewire-multi-output"
-STATE_FILE = STATE_DIR / "state.json"
 
-# Also clean up legacy state file from the old script
-LEGACY_STATE_FILE = Path.home() / ".cache" / "multi-output-state.json"
+# Legacy paths (pre-profile era)
+LEGACY_CONFIG_FILE = CONFIG_DIR / "config.json"
+LEGACY_STATE_FILE_NEW = STATE_DIR / "state.json"
+LEGACY_STATE_FILE_OLD = Path.home() / ".cache" / "multi-output-state.json"
 
 SYSTEMD_SERVICE_DIR = Path.home() / ".config" / "systemd" / "user"
-SYSTEMD_SERVICE_NAME = "multi-output.service"
+SYSTEMD_TEMPLATE_NAME = "multi-output@.service"
+LEGACY_SERVICE_NAME = "multi-output.service"
+
+MAX_SLUG_LENGTH = 32
+
+
+def slugify(name: str) -> str:
+    """Convert a human-readable name into a filesystem-safe slug."""
+    slug = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
+    return slug[:MAX_SLUG_LENGTH] or "default"
+
+
+def null_sink_name(slug: str) -> str:
+    """PipeWire null sink node name for a profile."""
+    return f"multi_out_{slug}"
+
+
+def _config_path(slug: str) -> Path:
+    return PROFILES_DIR / f"{slug}.json"
+
+
+def _state_path(slug: str) -> Path:
+    return STATE_DIR / f"{slug}.json"
 
 
 @dataclass
@@ -46,6 +70,7 @@ class SpeakerConfig:
 class MultiOutputConfig:
     """Configuration for the multi-output setup."""
 
+    slug: str = "default"
     name: str = "Speakers/Soundbar"  # device description shown in GNOME
     speakers: list[SpeakerConfig] = field(default_factory=list)
 
@@ -65,9 +90,69 @@ class SpeakerState:
 class MultiOutputState:
     """Runtime state for the entire multi-output setup."""
 
-    null_node_id: str
-    monitor_source_id: str
+    slug: str = "default"
+    null_node_id: str = ""
+    monitor_source_id: str = ""
     speakers: list[SpeakerState] = field(default_factory=list)
+
+
+# --- Migration ---
+
+
+def migrate_if_needed() -> None:
+    """Migrate legacy single-config layout to per-profile layout."""
+    if PROFILES_DIR.exists() or not LEGACY_CONFIG_FILE.exists():
+        return
+
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Migrate config
+    try:
+        data = json.loads(LEGACY_CONFIG_FILE.read_text())
+        data["slug"] = "default"
+        _config_path("default").write_text(json.dumps(data, indent=2) + "\n")
+        LEGACY_CONFIG_FILE.unlink()
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    # Migrate state
+    for legacy_state in (LEGACY_STATE_FILE_NEW, LEGACY_STATE_FILE_OLD):
+        try:
+            data = json.loads(legacy_state.read_text())
+            data["slug"] = "default"
+            _state_path("default").write_text(json.dumps(data, indent=2) + "\n")
+            legacy_state.unlink()
+            break
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+
+    # Migrate systemd service
+    old_service = SYSTEMD_SERVICE_DIR / LEGACY_SERVICE_NAME
+    if old_service.exists():
+        was_enabled = False
+        result = subprocess.run(
+            ["systemctl", "--user", "is-enabled", LEGACY_SERVICE_NAME],
+            capture_output=True, text=True,
+        )
+        was_enabled = result.stdout.strip() == "enabled"
+
+        if was_enabled:
+            subprocess.run(
+                ["systemctl", "--user", "disable", LEGACY_SERVICE_NAME],
+                capture_output=True,
+            )
+        old_service.unlink(missing_ok=True)
+
+        install_service()
+        if was_enabled:
+            subprocess.run(
+                ["systemctl", "--user", "enable", f"multi-output@default.service"],
+                capture_output=True,
+            )
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            capture_output=True,
+        )
 
 
 # --- Sink discovery ---
@@ -136,11 +221,14 @@ def resolve_sink(identifier: str | None) -> int | None:
 def get_available_sinks(exclude_names: list[str] | None = None) -> list[dict]:
     """Get sinks available for selection, excluding null sinks and specified names."""
     exclude = set(exclude_names or [])
-    exclude.add(NULL_SINK_NAME)
+    # Exclude null sinks from all running profiles
+    for slug in list_running_profiles():
+        exclude.add(null_sink_name(slug))
     sinks = get_sinks()
     available = []
     for s in sinks:
-        if s["name"] not in exclude:
+        # Exclude by name and any multi_out* sink (prevent feedback loops)
+        if s["name"] not in exclude and not s["name"].startswith("multi_out"):
             s["description"] = get_sink_description(s["index"])
             available.append(s)
     return available
@@ -171,25 +259,74 @@ def select_sink_interactive(
         sys.exit(1)
 
 
+# --- Profile management ---
+
+
+def list_profiles() -> list[str]:
+    """Return all saved profile slugs."""
+    if not PROFILES_DIR.exists():
+        return []
+    return sorted(
+        p.stem for p in PROFILES_DIR.glob("*.json")
+    )
+
+
+def list_running_profiles() -> list[str]:
+    """Return slugs that have state files (potentially running)."""
+    if not STATE_DIR.exists():
+        return []
+    slugs = []
+    for p in STATE_DIR.glob("*.json"):
+        # Skip legacy state file name
+        if p.name == "state.json":
+            continue
+        slugs.append(p.stem)
+    return sorted(slugs)
+
+
+def delete_profile(slug: str) -> None:
+    """Remove a profile's config file."""
+    path = _config_path(slug)
+    if path.exists():
+        path.unlink()
+
+
+def _unique_slug(desired: str) -> str:
+    """Return a slug that doesn't collide with existing profiles."""
+    slug = slugify(desired)
+    if not _config_path(slug).exists():
+        return slug
+    for i in range(2, 100):
+        candidate = f"{slug}_{i}"[:MAX_SLUG_LENGTH]
+        if not _config_path(candidate).exists():
+            return candidate
+    return slug
+
+
 # --- Config persistence ---
 
 
 def save_config(config: MultiOutputConfig) -> None:
-    """Save configuration to config.json."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    """Save configuration to its profile file."""
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     data = {
+        "slug": config.slug,
         "name": config.name,
         "speakers": [asdict(s) for s in config.speakers],
     }
-    CONFIG_FILE.write_text(json.dumps(data, indent=2) + "\n")
+    _config_path(config.slug).write_text(json.dumps(data, indent=2) + "\n")
 
 
-def load_config() -> MultiOutputConfig | None:
-    """Load configuration from config.json."""
+def load_config(slug: str = "default") -> MultiOutputConfig | None:
+    """Load configuration for a profile slug."""
     try:
-        data = json.loads(CONFIG_FILE.read_text())
+        data = json.loads(_config_path(slug).read_text())
         speakers = [SpeakerConfig(**s) for s in data.get("speakers", [])]
-        return MultiOutputConfig(name=data.get("name", "Speakers/Soundbar"), speakers=speakers)
+        return MultiOutputConfig(
+            slug=data.get("slug", slug),
+            name=data.get("name", "Speakers/Soundbar"),
+            speakers=speakers,
+        )
     except (FileNotFoundError, json.JSONDecodeError, TypeError):
         return None
 
@@ -198,64 +335,40 @@ def load_config() -> MultiOutputConfig | None:
 
 
 def save_state(state: MultiOutputState) -> None:
-    """Save runtime state to state.json."""
+    """Save runtime state for a profile."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     data = {
+        "slug": state.slug,
         "null_node_id": state.null_node_id,
         "monitor_source_id": state.monitor_source_id,
         "speakers": [asdict(s) for s in state.speakers],
     }
-    STATE_FILE.write_text(json.dumps(data, indent=2) + "\n")
+    _state_path(state.slug).write_text(json.dumps(data, indent=2) + "\n")
 
 
-def load_state() -> MultiOutputState | None:
-    """Load runtime state from state.json."""
-    # Try new state file first, then legacy
-    for path in (STATE_FILE, LEGACY_STATE_FILE):
-        try:
-            data = json.loads(path.read_text())
-            # Handle legacy 2-speaker state format
-            if "speakers" not in data:
-                speakers = []
-                if "slow_pid" in data:
-                    speakers.append(
-                        SpeakerState(
-                            sink_id=data["slow_id"],
-                            sink_name=data.get("slow_name", ""),
-                            label=data.get("slow_desc", ""),
-                            delay_ms=0,
-                            pid=data["slow_pid"],
-                        )
-                    )
-                if "fast_pid" in data:
-                    speakers.append(
-                        SpeakerState(
-                            sink_id=data["fast_id"],
-                            sink_name=data.get("fast_name", ""),
-                            label=data.get("fast_desc", ""),
-                            delay_ms=data.get("delay_ms", 0),
-                            pid=data["fast_pid"],
-                        )
-                    )
-                return MultiOutputState(
-                    null_node_id=data.get("null_node_id", ""),
-                    monitor_source_id=data.get("monitor_source_id", ""),
-                    speakers=speakers,
-                )
-            speakers = [SpeakerState(**s) for s in data["speakers"]]
-            return MultiOutputState(
-                null_node_id=data["null_node_id"],
-                monitor_source_id=data["monitor_source_id"],
-                speakers=speakers,
-            )
-        except (FileNotFoundError, json.JSONDecodeError, TypeError, KeyError):
-            continue
-    return None
+def load_state(slug: str = "default") -> MultiOutputState | None:
+    """Load runtime state for a profile slug."""
+    try:
+        data = json.loads(_state_path(slug).read_text())
+        speakers = [SpeakerState(**s) for s in data["speakers"]]
+        return MultiOutputState(
+            slug=data.get("slug", slug),
+            null_node_id=data["null_node_id"],
+            monitor_source_id=data["monitor_source_id"],
+            speakers=speakers,
+        )
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, KeyError):
+        return None
 
 
-def clear_state() -> None:
-    """Remove state files."""
-    for path in (STATE_FILE, LEGACY_STATE_FILE):
+def clear_state(slug: str = "default") -> None:
+    """Remove state file for a profile."""
+    try:
+        _state_path(slug).unlink()
+    except FileNotFoundError:
+        pass
+    # Also clean up legacy files if they match
+    for path in (LEGACY_STATE_FILE_NEW, LEGACY_STATE_FILE_OLD):
         try:
             path.unlink()
         except FileNotFoundError:
@@ -265,15 +378,16 @@ def clear_state() -> None:
 # --- Audio engine ---
 
 
-def _find_monitor_source_id() -> str | None:
-    """Find the monitor source ID for the null sink."""
+def _find_monitor_source_id(slug: str) -> str | None:
+    """Find the monitor source ID for a profile's null sink."""
+    sink_name = null_sink_name(slug)
     result = subprocess.run(
         ["pactl", "list", "short", "sources"],
         capture_output=True,
         text=True,
     )
     for line in result.stdout.splitlines():
-        if f"{NULL_SINK_NAME}.monitor" in line:
+        if f"{sink_name}.monitor" in line:
             return line.split("\t")[0]
     return None
 
@@ -282,6 +396,7 @@ def _launch_loopback(
     monitor_source_id: str,
     sink_id: int,
     delay_ms: float,
+    slug: str,
     index: int,
 ) -> subprocess.Popen:
     """Launch a pw-loopback process for one speaker."""
@@ -292,7 +407,7 @@ def _launch_loopback(
         "-P",
         str(sink_id),
         "-n",
-        f"loopback-{index}",
+        f"loopback-{slug}-{index}",
         "-i",
         "node.dont-reconnect=true",
         "-o",
@@ -308,14 +423,31 @@ def _launch_loopback(
     )
 
 
+def _check_speaker_conflicts(config: MultiOutputConfig) -> None:
+    """Raise if any speaker in config is already used by another running profile."""
+    wanted = {s.sink_name for s in config.speakers}
+    for slug in list_running_profiles():
+        if slug == config.slug:
+            continue
+        state = load_state(slug)
+        if state is None:
+            continue
+        for speaker in state.speakers:
+            if speaker.sink_name in wanted:
+                raise RuntimeError(
+                    f"Speaker '{speaker.label or speaker.sink_name}' is already "
+                    f"in use by running profile '{slug}'."
+                )
+
+
 def start(config: MultiOutputConfig, wait: bool = False, timeout: int = 300) -> MultiOutputState:
-    """Start multi-output routing.
+    """Start multi-output routing for a profile.
 
     Creates a null sink, launches pw-loopback for each speaker, and sets
     the null sink as the default output.
 
     Args:
-        config: Speaker configuration.
+        config: Speaker configuration (carries its own slug).
         wait: If True, poll until all sinks appear (for systemd use).
         timeout: Max seconds to wait for sinks (only if wait=True).
 
@@ -323,13 +455,18 @@ def start(config: MultiOutputConfig, wait: bool = False, timeout: int = 300) -> 
         The runtime state.
 
     Raises:
-        RuntimeError: If setup fails.
+        RuntimeError: If setup fails or speakers conflict with another profile.
     """
-    # Stop any existing setup first
-    stop(quiet=True)
+    slug = config.slug
+
+    # Stop this profile if already running (not other profiles)
+    stop(slug, quiet=True)
 
     if not config.speakers:
         raise RuntimeError("No speakers configured.")
+
+    # Check for conflicts with other running profiles
+    _check_speaker_conflicts(config)
 
     # Resolve all sinks
     sink_ids: list[int] = []
@@ -347,8 +484,9 @@ def start(config: MultiOutputConfig, wait: bool = False, timeout: int = 300) -> 
         if not speaker.label:
             speaker.label = get_sink_description(sink_ids[i])
 
-    # Create null sink via pw-cli (handles spaces in description correctly)
-    # Sanitize the name to prevent property injection via quote characters
+    sink_node_name = null_sink_name(slug)
+
+    # Create null sink via pw-cli
     safe_name = re.sub(r'[^a-zA-Z0-9 /\-_]', '', config.name) or "Multi Output"
     result = subprocess.run(
         [
@@ -356,7 +494,7 @@ def start(config: MultiOutputConfig, wait: bool = False, timeout: int = 300) -> 
             "create-node",
             "adapter",
             "{ "
-            f"factory.name=support.null-audio-sink node.name={NULL_SINK_NAME} "
+            f"factory.name=support.null-audio-sink node.name={sink_node_name} "
             f'node.description="{safe_name}" '
             "media.class=Audio/Sink object.linger=true audio.position=[FL,FR]"
             " }",
@@ -368,17 +506,17 @@ def start(config: MultiOutputConfig, wait: bool = False, timeout: int = 300) -> 
     null_node_id = result.stdout.strip().removeprefix("id:").strip().rstrip(",")
 
     # Find monitor source
-    monitor_source_id = _find_monitor_source_id()
+    monitor_source_id = _find_monitor_source_id(slug)
     if monitor_source_id is None:
-        raise RuntimeError("Could not find multi_out monitor source.")
+        raise RuntimeError(f"Could not find {sink_node_name} monitor source.")
 
     # Set as default sink
-    subprocess.run(["pactl", "set-default-sink", NULL_SINK_NAME], check=True)
+    subprocess.run(["pactl", "set-default-sink", sink_node_name], check=True)
 
     # Launch loopbacks
     speaker_states: list[SpeakerState] = []
     for i, (speaker, sink_id) in enumerate(zip(config.speakers, sink_ids)):
-        proc = _launch_loopback(monitor_source_id, sink_id, speaker.delay_ms, i)
+        proc = _launch_loopback(monitor_source_id, sink_id, speaker.delay_ms, slug, i)
         # Look up current sink name (in case we resolved from prefix)
         sink_name = speaker.sink_name
         for s in get_sinks():
@@ -396,6 +534,7 @@ def start(config: MultiOutputConfig, wait: bool = False, timeout: int = 300) -> 
         )
 
     state = MultiOutputState(
+        slug=slug,
         null_node_id=null_node_id,
         monitor_source_id=monitor_source_id,
         speakers=speaker_states,
@@ -423,12 +562,12 @@ def _kill_loopback(pid: int) -> None:
         pass
 
 
-def stop(quiet: bool = False) -> None:
-    """Stop multi-output and restore default sink."""
-    state = load_state()
+def stop(slug: str = "default", quiet: bool = False) -> None:
+    """Stop multi-output for a specific profile and restore default sink."""
+    state = load_state(slug)
     if state is None:
         if not quiet:
-            print("No multi-output session running.")
+            print(f"No multi-output session running for profile '{slug}'.")
         return
 
     # Kill loopback processes (verified before sending signal)
@@ -437,42 +576,56 @@ def stop(quiet: bool = False) -> None:
 
     # Destroy null sink node
     subprocess.run(
-        ["pw-cli", "destroy", NULL_SINK_NAME],
+        ["pw-cli", "destroy", null_sink_name(slug)],
         capture_output=True,
     )
 
-    # Restore default to the first wired (non-Bluetooth) speaker, or just the first one
-    restore_sink = None
-    for speaker in state.speakers:
-        if not speaker.sink_name.startswith("bluez_"):
-            restore_sink = speaker.sink_name
-            break
-    if restore_sink is None and state.speakers:
-        restore_sink = state.speakers[0].sink_name
-    if restore_sink:
-        subprocess.run(
-            ["pactl", "set-default-sink", restore_sink],
-            capture_output=True,
-        )
+    clear_state(slug)
 
-    clear_state()
+    # Only restore default sink when no other profiles are still running
+    if not list_running_profiles():
+        restore_sink = None
+        for speaker in state.speakers:
+            if not speaker.sink_name.startswith("bluez_"):
+                restore_sink = speaker.sink_name
+                break
+        if restore_sink is None and state.speakers:
+            restore_sink = state.speakers[0].sink_name
+        if restore_sink:
+            subprocess.run(
+                ["pactl", "set-default-sink", restore_sink],
+                capture_output=True,
+            )
+
     if not quiet:
-        print("Multi-output stopped.")
+        print(f"Multi-output stopped for profile '{slug}'.")
 
 
-def update_speaker_delay(index: int, delay_ms: float) -> None:
+def stop_all(quiet: bool = False) -> None:
+    """Stop all running profiles."""
+    running = list_running_profiles()
+    if not running:
+        if not quiet:
+            print("No multi-output sessions running.")
+        return
+    for slug in running:
+        stop(slug, quiet=quiet)
+
+
+def update_speaker_delay(slug: str, index: int, delay_ms: float) -> None:
     """Update the delay for a single speaker (kills and relaunches its loopback).
 
     Args:
+        slug: Profile slug.
         index: Speaker index (0-based).
         delay_ms: New delay in milliseconds.
 
     Raises:
         RuntimeError: If no session is running or index is out of range.
     """
-    state = load_state()
+    state = load_state(slug)
     if state is None:
-        raise RuntimeError("No multi-output session running.")
+        raise RuntimeError(f"No multi-output session running for profile '{slug}'.")
 
     if index < 0 or index >= len(state.speakers):
         raise RuntimeError(
@@ -486,7 +639,7 @@ def update_speaker_delay(index: int, delay_ms: float) -> None:
 
     # Relaunch with new delay
     proc = _launch_loopback(
-        state.monitor_source_id, speaker.sink_id, delay_ms, index
+        state.monitor_source_id, speaker.sink_id, delay_ms, slug, index
     )
 
     speaker.pid = proc.pid
@@ -539,9 +692,9 @@ def wait_for_sinks(
     )
 
 
-def is_running() -> bool:
-    """Check if a multi-output session is active."""
-    state = load_state()
+def is_running(slug: str = "default") -> bool:
+    """Check if a profile's multi-output session is active."""
+    state = load_state(slug)
     if state is None:
         return False
     # Verify at least one loopback process is alive
@@ -552,7 +705,7 @@ def is_running() -> bool:
         except (ProcessLookupError, OSError):
             continue
     # All processes dead — clean up stale state
-    clear_state()
+    clear_state(slug)
     return False
 
 
@@ -615,60 +768,70 @@ def _project_dir() -> Path:
 
 
 def install_service() -> None:
-    """Write (or overwrite) the systemd user service file and reload the daemon."""
+    """Write (or overwrite) the systemd user service template and reload the daemon."""
     project = _project_dir()
-    service_path = SYSTEMD_SERVICE_DIR / SYSTEMD_SERVICE_NAME
+    service_path = SYSTEMD_SERVICE_DIR / SYSTEMD_TEMPLATE_NAME
     SYSTEMD_SERVICE_DIR.mkdir(parents=True, exist_ok=True)
-    # Escape the project path for safe embedding in shell and Python contexts
     shell_path = shlex.quote(str(project / "multi-output-service.py"))
     python_path = str(project).replace("\\", "\\\\").replace("'", "\\'")
     service_path.write_text(
         f"""\
 [Unit]
-Description=Multi-output speaker sync (PipeWire)
+Description=Multi-output speaker sync (PipeWire) - profile %i
 After=pipewire.service pipewire-pulse.service
 Requires=pipewire.service pipewire-pulse.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/python3 {shell_path}
-ExecStop=/usr/bin/python3 -c "import sys; sys.path.insert(0, '{python_path}'); from multi_output import core; core.stop()"
+ExecStart=/usr/bin/python3 {shell_path} %i
+ExecStop=/usr/bin/python3 -c "import sys; sys.path.insert(0, '{python_path}'); from multi_output import core; core.stop('%i')"
 
 [Install]
 WantedBy=default.target
 """
     )
+
+    # Remove legacy non-template service if present
+    legacy = SYSTEMD_SERVICE_DIR / LEGACY_SERVICE_NAME
+    if legacy.exists():
+        legacy.unlink()
+
     subprocess.run(
         ["systemctl", "--user", "daemon-reload"],
         capture_output=True,
     )
 
 
+def _service_instance_name(slug: str) -> str:
+    return f"multi-output@{slug}.service"
+
+
 def is_service_installed() -> bool:
-    """Check if the systemd user service file exists."""
-    return (SYSTEMD_SERVICE_DIR / SYSTEMD_SERVICE_NAME).exists()
+    """Check if the systemd user service template exists."""
+    return (SYSTEMD_SERVICE_DIR / SYSTEMD_TEMPLATE_NAME).exists()
 
 
-def is_service_enabled() -> bool:
-    """Check if the systemd user service is enabled."""
+def is_service_enabled(slug: str = "default") -> bool:
+    """Check if the systemd user service is enabled for a profile."""
     result = subprocess.run(
-        ["systemctl", "--user", "is-enabled", SYSTEMD_SERVICE_NAME],
+        ["systemctl", "--user", "is-enabled", _service_instance_name(slug)],
         capture_output=True,
         text=True,
     )
     return result.stdout.strip() == "enabled"
 
 
-def set_service_enabled(enabled: bool) -> None:
-    """Enable or disable the systemd user service.
+def set_service_enabled(slug: str, enabled: bool) -> None:
+    """Enable or disable the systemd user service for a profile.
 
-    Installs the service file first if it doesn't exist.
+    Installs the service template first if it doesn't exist.
     """
     if enabled:
         install_service()
     subprocess.run(
-        ["systemctl", "--user", "enable" if enabled else "disable", SYSTEMD_SERVICE_NAME],
+        ["systemctl", "--user", "enable" if enabled else "disable",
+         _service_instance_name(slug)],
         capture_output=True,
         check=True,
     )
